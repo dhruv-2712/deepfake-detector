@@ -70,22 +70,21 @@ def predict_image(image: Image.Image):
 
     image     = image.convert("RGB")
     annotated = face_det.draw_boxes(image)
-    crop, face_found = face_det.crop_or_resize(image, size=224)
 
-    tensor = _IMG_TRANSFORM(crop).unsqueeze(0).to(device)
+    # Model was trained on plain resized images — match that preprocessing exactly
+    tensor = _IMG_TRANSFORM(image).unsqueeze(0).to(device)
 
     # Grad-CAM needs gradients — run before the no_grad inference block
     cam_np      = gradcam(tensor)
-    cam_overlay = gradcam.overlay(cam_np, crop)
+    cam_overlay = gradcam.overlay(cam_np, image.resize((224, 224)))
 
     with torch.no_grad():
         score = fusion(img_emb=img_ext(tensor)).squeeze().item()
 
     label   = "FAKE" if score >= 0.5 else "REAL"
     dct     = dct_peak_score(tensor.squeeze(0))
-    source  = "face crop" if face_found else "full frame (no face detected)"
     verdict = f"**{label}** — {score:.1%} fake probability"
-    details = f"Analysed: {source} | DCT peak score: {dct:.4f}"
+    details = f"DCT peak score: {dct:.4f}"
     return verdict, round(score, 4), details, annotated, cam_overlay
 
 
