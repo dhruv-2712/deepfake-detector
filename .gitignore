@@ -1,0 +1,39 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# datasets — too large for git
+data/
+
+# model weights
+checkpoints/
+embeddings/
+onnx/
+
+# eval outputs
+results/
+
+# jupyter
+notebooks/.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# env
+.env
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Claude Code
+.claude/
+
+# temp files
+*.tmp
+*.log
