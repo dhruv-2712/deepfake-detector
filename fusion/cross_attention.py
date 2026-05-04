@@ -26,7 +26,6 @@ class MultiModalFusionClassifier(nn.Module):
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(256, 1),
-            nn.Sigmoid(),
         )
 
     def _resolve(self, emb: Optional[torch.Tensor], batch_size: int) -> torch.Tensor:

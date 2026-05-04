@@ -81,14 +81,14 @@ class FaceDetector:
     # Public API
     # ------------------------------------------------------------------
 
-    def detect_all(self, image: Image.Image, size: int = 224) -> List[Image.Image]:
+    def detect_all(self, image: Image.Image, size: int = 299) -> List[Image.Image]:
         """Returns every detected face as a cropped PIL image."""
         return [
             crop for box, _ in self._raw_boxes(image)
             if (crop := self._crop_box(image, box, size)) is not None
         ]
 
-    def detect_largest(self, image: Image.Image, size: int = 224) -> Optional[Image.Image]:
+    def detect_largest(self, image: Image.Image, size: int = 299) -> Optional[Image.Image]:
         """Returns the largest detected face, or None."""
         boxes = self._raw_boxes(image)
         if not boxes:
@@ -97,7 +97,7 @@ class FaceDetector:
         return self._crop_box(image, box, size)
 
     def crop_or_resize(
-        self, image: Image.Image, size: int = 224
+        self, image: Image.Image, size: int = 299
     ) -> Tuple[Image.Image, bool]:
         """Always returns (image, face_found). Falls back to full-frame resize."""
         face = self.detect_largest(image, size)

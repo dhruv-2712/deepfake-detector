@@ -73,34 +73,28 @@ def dct_peak_score(image_tensor: torch.Tensor) -> float:
 class ImageFeatureExtractor(nn.Module):
     """
     Extracts a (B, 512) embedding from RGB images using:
-      - EfficientNet-B4 backbone (1792-d global pool features)
-      - SRM noise residual path (frozen, feeds into backbone concat)
-      - DCT luma analysis (returns scalar diagnostic, not fused here)
+      - XceptionNet backbone (2048-d global pool features)
+      - SRM noise residual path (frozen, adds high-freq artifact signal)
+    Input: (B, 3, 299, 299), normalized to [-1, 1].
     """
 
     def __init__(self, pretrained: bool = True):
         super().__init__()
         self.backbone = timm.create_model(
-            "efficientnet_b4", pretrained=pretrained, num_classes=0
-        )  # output: (B, 1792)
+            "legacy_xception", pretrained=pretrained, num_classes=0
+        )  # output: (B, 2048)
         self.srm = SRMConv()
-
-        # Project SRM features to match a spatial size backbone can absorb via
-        # an early-fusion stem: we concatenate SRM residual (30-ch) into a
-        # learned 3→3 channel adapter before EfficientNet sees the image.
-        # Simpler: project SRM pool to 1792, add to backbone features.
         self.srm_pool = nn.AdaptiveAvgPool2d(1)
-        self.srm_proj = nn.Linear(30, 1792)
-
-        self.proj = nn.Linear(1792, 512)
+        self.srm_proj = nn.Linear(30, 2048)
+        self.proj = nn.Linear(2048, 512)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, 3, 224, 224)
-        cnn_feat = self.backbone(x)                     # (B, 1792)
+        # x: (B, 3, 299, 299)
+        cnn_feat = self.backbone(x)                     # (B, 2048)
         srm_maps = self.srm(x)                          # (B, 30, H, W)
         srm_feat = self.srm_pool(srm_maps).flatten(1)   # (B, 30)
-        srm_feat = self.srm_proj(srm_feat)              # (B, 1792)
-        fused = cnn_feat + srm_feat                     # (B, 1792)
+        srm_feat = self.srm_proj(srm_feat)              # (B, 2048)
+        fused = cnn_feat + srm_feat                     # (B, 2048)
         return self.proj(fused)                         # (B, 512)
 
 
@@ -111,11 +105,11 @@ if __name__ == "__main__":
     model = ImageFeatureExtractor(pretrained=False).to(device)
     model.eval()
 
-    dummy = torch.rand(2, 3, 224, 224, device=device)
+    dummy = torch.rand(2, 3, 299, 299, device=device)
     with torch.no_grad():
         out = model(dummy)
     print(f"Output shape: {out.shape}")  # expect (2, 512)
 
-    single = torch.rand(3, 224, 224)
+    single = torch.rand(3, 299, 299)
     score = dct_peak_score(single)
     print(f"DCT peak score (random image): {score:.4f}")

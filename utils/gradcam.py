@@ -1,7 +1,7 @@
 """
 Grad-CAM visualization for the image extractor.
 
-Target layer: the last stage of EfficientNet-B4's block stack.
+Target layer: the last stage of XceptionNet's block stack.
 No extra dependencies — implemented with raw PyTorch hooks.
 """
 from __future__ import annotations
@@ -12,25 +12,46 @@ import torch
 from PIL import Image
 
 
+def _resolve_target_layer(img_ext):
+    """
+    Return the best target layer for Grad-CAM.
+
+    Priority:
+      1. XceptionNet attributes: act5, bn5, conv5
+      2. EfficientNet fallback: backbone.blocks[-1]
+      3. Generic fallback: second-to-last child module
+    """
+    backbone = getattr(img_ext, "backbone", img_ext)
+    for attr in ("act5", "bn5", "conv5"):
+        if hasattr(backbone, attr):
+            return getattr(backbone, attr)
+    if hasattr(backbone, "blocks"):
+        return backbone.blocks[-1]
+    children = list(img_ext.children())
+    if len(children) >= 2:
+        return children[-2]
+    return children[-1]
+
+
 class DeepfakeGradCAM:
     """
-    Wraps ImageFeatureExtractor + MultiModalFusionClassifier to produce
-    Grad-CAM heatmaps over the EfficientNet-B4 backbone's last stage.
+    Wraps ImageFeatureExtractor + head (nn.Module) to produce
+    Grad-CAM heatmaps over the XceptionNet backbone's last stage.
 
     Usage:
-        cam = DeepfakeGradCAM(img_ext, fusion)
+        cam = DeepfakeGradCAM(img_ext, head)
         heatmap = cam(tensor)             # (H, W) float in [0,1]
         overlay = cam.overlay(heatmap, pil_image)
         cam.remove_hooks()                # call when done to avoid memory leaks
     """
 
-    def __init__(self, img_ext, fusion):
+    def __init__(self, img_ext, head):
         self.img_ext = img_ext
-        self.fusion  = fusion
+        self.head    = head
         self._acts: torch.Tensor | None  = None
         self._grads: torch.Tensor | None = None
 
-        target = img_ext.backbone.blocks[-1]
+        target = _resolve_target_layer(img_ext)
         self._fwd = target.register_forward_hook(
             lambda m, inp, out: setattr(self, "_acts", out)
         )
@@ -40,15 +61,15 @@ class DeepfakeGradCAM:
 
     def __call__(self, tensor: torch.Tensor) -> np.ndarray:
         """
-        tensor: (1, 3, 224, 224), already on the correct device.
+        tensor: (1, 3, 299, 299), already on the correct device.
         Returns heatmap (H, W) in [0, 1].
         """
         self.img_ext.zero_grad()
-        self.fusion.zero_grad()
+        self.head.zero_grad()
 
         with torch.enable_grad():
             emb   = self.img_ext(tensor)
-            score = self.fusion(img_emb=emb)
+            score = self.head(emb)
             score.sum().backward()
 
         acts  = self._acts   # (1, C, H, W)
@@ -66,7 +87,7 @@ class DeepfakeGradCAM:
 
         # Zero grads so stray gradients don't affect subsequent training steps
         self.img_ext.zero_grad()
-        self.fusion.zero_grad()
+        self.head.zero_grad()
 
         return cam.detach().cpu().numpy()
 
@@ -74,7 +95,7 @@ class DeepfakeGradCAM:
         self,
         cam: np.ndarray,
         pil_image: Image.Image,
-        size: int = 224,
+        size: int = 299,
         alpha: float = 0.45,
     ) -> Image.Image:
         """Blend a JET heatmap over the image. Returns a PIL Image."""

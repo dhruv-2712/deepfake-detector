@@ -6,8 +6,8 @@ import torchvision.transforms.functional as TF
 from PIL import Image
 from torchvision import transforms
 
-_IMAGENET_MEAN = [0.485, 0.456, 0.406]
-_IMAGENET_STD  = [0.229, 0.224, 0.225]
+_XCEPTION_MEAN = [0.5, 0.5, 0.5]
+_XCEPTION_STD  = [0.5, 0.5, 0.5]
 
 
 class RandomJPEGCompression:
@@ -67,21 +67,20 @@ class RandomHorizontalFlipVideo:
         return frames
 
 
-def get_train_transforms(size: int = 224) -> transforms.Compose:
+def get_train_transforms(size: int = 299) -> transforms.Compose:
     return transforms.Compose([
         transforms.Resize((size, size)),
         transforms.RandomHorizontalFlip(),
         transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1, hue=0.05),
         transforms.ToTensor(),
         RandomGaussianNoise(std_max=0.03),
-        RandomJPEGCompression(quality_low=50, quality_high=95),
-        transforms.Normalize(mean=_IMAGENET_MEAN, std=_IMAGENET_STD),
+        transforms.Normalize(mean=_XCEPTION_MEAN, std=_XCEPTION_STD),
     ])
 
 
-def get_val_transforms(size: int = 224) -> transforms.Compose:
+def get_val_transforms(size: int = 299) -> transforms.Compose:
     return transforms.Compose([
         transforms.Resize((size, size)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=_IMAGENET_MEAN, std=_IMAGENET_STD),
+        transforms.Normalize(mean=_XCEPTION_MEAN, std=_XCEPTION_STD),
     ])

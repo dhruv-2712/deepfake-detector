@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from detectors.audio.extractor import AudioFeatureExtractor
 from detectors.image.extractor import ImageFeatureExtractor
 from detectors.video.extractor import CLIP_FRAMES, VideoFeatureExtractor
+from utils.augmentations import get_val_transforms
 
 
 # ---------------------------------------------------------------------------
@@ -129,11 +130,14 @@ def main():
                 raise ValueError("--ffpp_root required")
             from benchmarks.ff_plusplus import FaceForensicsDataset
             fpv = CLIP_FRAMES if args.modality == "video" else args.frames_per_video
-            ds = FaceForensicsDataset(
-                args.ffpp_root, split=split,
+            ds_kwargs = dict(
+                split=split,
                 compression=args.compression,
                 frames_per_video=fpv,
             )
+            if args.modality == "image":
+                ds_kwargs["transform"] = get_val_transforms(size=299)
+            ds = FaceForensicsDataset(args.ffpp_root, **ds_kwargs)
         else:
             if not args.asvspoof_root:
                 raise ValueError("--asvspoof_root required")

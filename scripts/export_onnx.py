@@ -5,10 +5,10 @@ Usage:
     python scripts/export_onnx.py --checkpoint checkpoints/best.pt --output_dir onnx/
 
 Exports:
-    onnx/image_extractor.onnx   (B, 3, 224, 224)  → (B, 512)
+    onnx/image_extractor.onnx   (B, 3, 299, 299)  → (B, 512)
     onnx/audio_extractor.onnx   (B, 64000)         → (B, 512)   [may skip if STFT fails]
     onnx/video_extractor.onnx   (B, 16, 3, 112, 112) → (B, 512)
-    onnx/fusion.onnx            (B, 512) × 3        → (B, 1)
+    onnx/head.onnx              (B, 512)            → (B, 1)
 """
 
 import argparse
@@ -23,17 +23,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from detectors.audio.extractor import AudioFeatureExtractor
 from detectors.image.extractor import ImageFeatureExtractor
 from detectors.video.extractor import CLIP_FRAMES, CLIP_SIZE, VideoFeatureExtractor
-from fusion.cross_attention import MultiModalFusionClassifier
-
-
-class FusionAllModalities(nn.Module):
-    """ONNX-friendly wrapper: takes all 3 embeddings as positional args."""
-    def __init__(self, fusion):
-        super().__init__()
-        self.fusion = fusion
-
-    def forward(self, img_emb, aud_emb, vid_emb):
-        return self.fusion(img_emb=img_emb, aud_emb=aud_emb, vid_emb=vid_emb)
 
 
 def try_export(model, dummy, path, input_names, output_names, dynamic_axes, opset=17):
@@ -89,7 +78,7 @@ def main():
     print("\nExporting image extractor...")
     try_export(
         img_ext,
-        torch.zeros(1, 3, 224, 224),
+        torch.zeros(1, 3, 299, 299),
         out / "image_extractor.onnx",
         input_names=["image"],
         output_names=["embedding"],
@@ -132,20 +121,23 @@ def main():
     )
 
     # -----------------------------------------------------------------------
-    # Fusion classifier (all-modalities wrapper)
+    # Head classifier
     # -----------------------------------------------------------------------
-    fusion = MultiModalFusionClassifier()
-    fusion.load_state_dict(state.get("fusion", {}), strict=False)
-    fusion_onnx = FusionAllModalities(fusion).eval()
-    dummy_embs = (torch.zeros(1, 512), torch.zeros(1, 512), torch.zeros(1, 512))
-    print("\nExporting fusion classifier...")
+    head = nn.Sequential(
+        nn.Linear(512, 256), nn.ReLU(), nn.Dropout(0.4),
+        nn.Linear(256, 64),  nn.ReLU(), nn.Dropout(0.3),
+        nn.Linear(64, 1),
+    )
+    head.load_state_dict(state.get("head", {}), strict=False)
+    head.eval()
+    print("\nExporting head classifier...")
     try_export(
-        fusion_onnx,
-        dummy_embs,
-        out / "fusion.onnx",
-        input_names=["img_emb", "aud_emb", "vid_emb"],
+        head,
+        torch.zeros(1, 512),
+        out / "head.onnx",
+        input_names=["embedding"],
         output_names=["fake_prob"],
-        dynamic_axes={k: {0: "batch"} for k in ["img_emb", "aud_emb", "vid_emb", "fake_prob"]},
+        dynamic_axes={"embedding": {0: "batch"}, "fake_prob": {0: "batch"}},
         opset=args.opset,
     )
 
