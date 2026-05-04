@@ -1,39 +1,33 @@
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
 *.pyd
 *.egg-info/
-.eggs/
 dist/
 build/
 
-# datasets — too large for git
-data/
+# Virtual environment
+.venv/
+venv/
+env/
 
-# model weights
+# Model artifacts
 checkpoints/
 embeddings/
 onnx/
-
-# eval outputs
 results/
+*.pt
+*.pth
+*.onnx
 
-# jupyter
-notebooks/.ipynb_checkpoints/
-*.ipynb_checkpoints
+# Large data
+data/
 
-# env
-.env
-.venv/
-venv/
-
-# IDE
-.vscode/
-.idea/
-
-# Claude Code
-.claude/
-
-# temp files
-*.tmp
+# Misc
+.DS_Store
 *.log
+face_detection_out.jpg
+
+# OMC internal state
+.omc/

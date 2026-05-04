@@ -11,27 +11,28 @@ import soundfile as sf
 import torch
 import torch.nn as nn
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from PIL import Image
 from torchvision import transforms
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from detectors.audio.extractor import AudioFeatureExtractor
-from detectors.image.extractor import ImageFeatureExtractor
+from detectors.image.extractor import ImageFeatureExtractor, dct_peak_score
 from detectors.video.extractor import CLIP_FRAMES, CLIP_SIZE, VideoFeatureExtractor
 from fusion.cross_attention import MultiModalFusionClassifier
+from utils.gradcam import DeepfakeGradCAM
 
 app = FastAPI(title="Deepfake Detector", version="2.0.0")
 
 # ---------------------------------------------------------------------------
 # Globals
 # ---------------------------------------------------------------------------
-_img_ext:  Optional[ImageFeatureExtractor]        = None
-_aud_ext:  Optional[AudioFeatureExtractor]         = None
-_vid_ext:  Optional[VideoFeatureExtractor]         = None
-_head:     Optional[nn.Module]                     = None
-_fusion:   Optional[MultiModalFusionClassifier]    = None
+_img_ext:  Optional[ImageFeatureExtractor]      = None
+_aud_ext:  Optional[AudioFeatureExtractor]      = None
+_vid_ext:  Optional[VideoFeatureExtractor]      = None
+_head:     Optional[nn.Module]                  = None
+_fusion:   Optional[MultiModalFusionClassifier] = None
 _device:   torch.device = torch.device("cpu")
 
 _IMG_TRANSFORM = transforms.Compose([
@@ -45,6 +46,23 @@ _VID_TRANSFORM = transforms.Compose([
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
 
+
+# ---------------------------------------------------------------------------
+# GradCAM adapter: routes a single image embedding through the fusion head
+# ---------------------------------------------------------------------------
+
+class _FusionScorer(nn.Module):
+    def __init__(self, fusion: MultiModalFusionClassifier):
+        super().__init__()
+        self.fusion = fusion
+
+    def forward(self, emb: torch.Tensor) -> torch.Tensor:
+        return self.fusion(img_emb=emb)
+
+
+# ---------------------------------------------------------------------------
+# Startup
+# ---------------------------------------------------------------------------
 
 @app.on_event("startup")
 async def load_models():
@@ -60,8 +78,9 @@ async def load_models():
         nn.Linear(64, 1),
     ).to(_device).eval()
 
-    # Try fusion checkpoint first, then image-only checkpoint
-    for ckpt_name in ("checkpoints/best_fusion.pt", "checkpoints/best.pt"):
+    # Prefer fusion checkpoint, fall back to image-only
+    for ckpt_name in ("checkpoints/best_fusion.pt", "checkpoints/best_audio.pt",
+                      "checkpoints/best.pt"):
         ckpt = Path(ckpt_name)
         if not ckpt.exists():
             continue
@@ -82,7 +101,7 @@ async def load_models():
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Scoring
 # ---------------------------------------------------------------------------
 
 def _score(img_emb=None, aud_emb=None, vid_emb=None) -> dict:
@@ -96,11 +115,19 @@ def _score(img_emb=None, aud_emb=None, vid_emb=None) -> dict:
     return {"is_fake": prob >= 0.5, "confidence": round(prob, 4)}
 
 
-def _image_embedding(data: bytes) -> torch.Tensor:
+# ---------------------------------------------------------------------------
+# Feature extraction helpers
+# ---------------------------------------------------------------------------
+
+def _image_embedding(data: bytes):
+    """Returns (emb (1,512), dct_score float, pil Image)."""
     img = Image.open(io.BytesIO(data)).convert("RGB")
+    raw = transforms.ToTensor()(img)          # (3, H, W) in [0,1]
+    dct = round(dct_peak_score(raw), 4)
     t = _IMG_TRANSFORM(img).unsqueeze(0).to(_device)
     with torch.no_grad():
-        return _img_ext(t)  # (1, 512)
+        emb = _img_ext(t)
+    return emb, dct, img
 
 
 def _audio_embedding(data: bytes) -> torch.Tensor:
@@ -114,15 +141,15 @@ def _audio_embedding(data: bytes) -> torch.Tensor:
     waveform = np.pad(waveform, (0, max(0, target - len(waveform))))[:target]
     t = torch.from_numpy(waveform).unsqueeze(0).to(_device)
     with torch.no_grad():
-        return _aud_ext(t)  # (1, 512)
+        return _aud_ext(t)
 
 
 def _video_embeddings(data: bytes):
+    """Returns (img_emb, aud_emb, vid_emb, temporal_score)."""
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
         f.write(data)
         mp4 = f.name
 
-    # --- frames ---
     cap   = cv2.VideoCapture(mp4)
     total = max(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), 1)
     step  = max(total // CLIP_FRAMES, 1)
@@ -139,17 +166,20 @@ def _video_embeddings(data: bytes):
         f224.append(_IMG_TRANSFORM(pil))
     cap.release()
 
-    img_emb = vid_emb = None
+    img_emb = vid_emb = temporal_score = None
     if f112:
         while len(f112) < CLIP_FRAMES:
             f112.append(f112[-1])
-        clip  = torch.stack(f112).unsqueeze(0).to(_device)  # (1, T, C, 112, 112)
-        batch = torch.stack(f224).to(_device)               # (T, C, 224, 224)
+        clip_stack = torch.stack(f112)                        # (T, C, H, W)
+        clip  = clip_stack.unsqueeze(0).to(_device)           # (1, T, C, H, W)
+        batch = torch.stack(f224).to(_device)                 # (T, C, H, W)
         with torch.no_grad():
             vid_emb = _vid_ext(clip)
             img_emb = _img_ext(batch).mean(0, keepdim=True)
+        temporal_score = round(
+            _vid_ext.temporal_consistency_score(clip_stack.to(_device)), 4
+        )
 
-    # --- audio ---
     aud_emb = None
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as wf:
         wav = wf.name
@@ -166,7 +196,7 @@ def _video_embeddings(data: bytes):
 
     Path(mp4).unlink(missing_ok=True)
     Path(wav).unlink(missing_ok=True)
-    return img_emb, aud_emb, vid_emb
+    return img_emb, aud_emb, vid_emb, temporal_score
 
 
 # ---------------------------------------------------------------------------
@@ -180,20 +210,43 @@ async def health():
 
 @app.post("/detect/image")
 async def detect_image(file: UploadFile = File(...)):
-    if _head is None:
+    if _head is None and _fusion is None:
         raise HTTPException(503, "Models not loaded")
     try:
-        img_emb = _image_embedding(await file.read())
+        img_emb, dct, _ = _image_embedding(await file.read())
     except Exception as e:
         raise HTTPException(400, f"Could not decode image: {e}")
     result = _score(img_emb=img_emb)
     result["modalities_used"] = ["image"]
+    result["dct_score"] = dct
     return JSONResponse(result)
+
+
+@app.post("/detect/image/heatmap")
+async def detect_image_heatmap(file: UploadFile = File(...)):
+    """Returns a PNG heatmap overlay showing which regions drove the prediction."""
+    if _img_ext is None:
+        raise HTTPException(503, "Models not loaded")
+    try:
+        data = await file.read()
+        img = Image.open(io.BytesIO(data)).convert("RGB")
+        t = _IMG_TRANSFORM(img).unsqueeze(0).to(_device)
+        scorer = _FusionScorer(_fusion) if _fusion is not None else _head
+        cam = DeepfakeGradCAM(_img_ext, scorer)
+        heatmap = cam(t)
+        overlay = cam.overlay(heatmap, img)
+        cam.remove_hooks()
+        buf = io.BytesIO()
+        overlay.save(buf, format="PNG")
+        buf.seek(0)
+        return StreamingResponse(buf, media_type="image/png")
+    except Exception as e:
+        raise HTTPException(400, f"Could not generate heatmap: {e}")
 
 
 @app.post("/detect/audio")
 async def detect_audio(file: UploadFile = File(...)):
-    if _head is None:
+    if _head is None and _fusion is None:
         raise HTTPException(503, "Models not loaded")
     try:
         aud_emb = _audio_embedding(await file.read())
@@ -206,10 +259,10 @@ async def detect_audio(file: UploadFile = File(...)):
 
 @app.post("/detect/video")
 async def detect_video(file: UploadFile = File(...)):
-    if _head is None:
+    if _head is None and _fusion is None:
         raise HTTPException(503, "Models not loaded")
     try:
-        img_emb, aud_emb, vid_emb = _video_embeddings(await file.read())
+        img_emb, aud_emb, vid_emb, temporal_score = _video_embeddings(await file.read())
     except Exception as e:
         raise HTTPException(400, f"Could not process video: {e}")
     if img_emb is None and vid_emb is None:
@@ -221,4 +274,6 @@ async def detect_video(file: UploadFile = File(...)):
     )
     result = _score(img_emb=img_emb, aud_emb=aud_emb, vid_emb=vid_emb)
     result["modalities_used"] = modalities
+    if temporal_score is not None:
+        result["temporal_consistency"] = temporal_score
     return JSONResponse(result)

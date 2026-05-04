@@ -102,6 +102,8 @@ def main():
     parser.add_argument("--batch_size",       type=int, default=32)
     parser.add_argument("--workers",          type=int, default=4)
     parser.add_argument("--output_dir",       default="embeddings")
+    parser.add_argument("--face_crop",        action="store_true",
+                        help="Use MTCNN face detection when loading FF++ frames.")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -137,6 +139,7 @@ def main():
             )
             if args.modality == "image":
                 ds_kwargs["transform"] = get_val_transforms(size=299)
+            ds_kwargs["use_face_crop"] = args.face_crop
             ds = FaceForensicsDataset(args.ffpp_root, **ds_kwargs)
         else:
             if not args.asvspoof_root:
