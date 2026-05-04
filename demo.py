@@ -40,9 +40,9 @@ face_det = FaceDetector(device=device)
 gradcam  = DeepfakeGradCAM(img_ext, fusion)
 
 _IMG_TRANSFORM = transforms.Compose([
-    transforms.Resize((224, 224)),
+    transforms.Resize((299, 299)),
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
 ])
 _VID_TRANSFORM = transforms.Compose([
     transforms.Resize((CLIP_SIZE, CLIP_SIZE)),
@@ -190,7 +190,7 @@ def predict_video(video_path: str):
 with gr.Blocks(title="Deepfake Detector") as demo:
     gr.Markdown(
         "# Deepfake Detector\n"
-        "Multimodal detection — EfficientNet-B4 · LCNN · R3D-18 · Cross-Attention Fusion"
+        "Multimodal detection — XceptionNet · LCNN · R3D-18 · Cross-Attention Fusion"
     )
 
     with gr.Tab("Image"):

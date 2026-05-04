@@ -8,7 +8,7 @@ Three specialist models each extract a 512-dimensional fingerprint from their re
 
 | Modality | Model | What it detects |
 |---|---|---|
-| Image | EfficientNet-B4 + SRM noise filters | GAN texture artifacts, camera noise anomalies |
+| Image | XceptionNet + SRM noise filters | GAN texture artifacts, camera noise anomalies |
 | Audio | LFCC + LCNN | Voice cloning artifacts in frequency patterns |
 | Video | R3D-18 (3D CNN) | Unnatural motion, temporal inconsistency |
 
@@ -18,7 +18,7 @@ A cross-attention fusion classifier combines whichever modalities are available 
 
 ```
 detectors/
-  image/extractor.py       # EfficientNet-B4 + SRM + DCT analysis
+  image/extractor.py       # XceptionNet + SRM + DCT analysis
   audio/extractor.py       # LFCC feature extraction + LCNN
   video/extractor.py       # R3D-18 temporal feature extraction
 fusion/
@@ -105,7 +105,7 @@ python eval.py --checkpoint checkpoints/best.pt \
                --modality image
 ```
 
-Reports AUC, Average Precision, and EER per manipulation type (Deepfakes, Face2Face, FaceSwap, NeuralTextures).
+Reports AUC, Average Precision, and EER per manipulation type (Deepfakes, Face2Face, FaceSwap, NeuralTextures, FaceShifter).
 
 ## REST API
 
@@ -142,4 +142,4 @@ python train.py --modality image --embeddings_dir embeddings/
 python scripts/export_onnx.py --checkpoint checkpoints/best.pt --output_dir onnx/
 ```
 
-Exports all four components (image extractor, audio extractor, video extractor, fusion classifier) separately.
+Exports all five components (image extractor, audio extractor, video extractor, head classifier, fusion classifier) separately.

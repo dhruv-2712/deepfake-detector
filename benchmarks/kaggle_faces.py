@@ -56,9 +56,9 @@ class KaggleFacesDataset(Dataset):
 
         self.samples = samples
         self.transform = transform if transform is not None else transforms.Compose([
-            transforms.Resize((224, 224)),
+            transforms.Resize((299, 299)),
             transforms.ToTensor(),
-            _NORMALIZE,
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
         ])
 
     def __len__(self) -> int:

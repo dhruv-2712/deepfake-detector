@@ -2,6 +2,7 @@ import io
 import subprocess
 import sys
 import tempfile
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -23,7 +24,12 @@ from detectors.video.extractor import CLIP_FRAMES, CLIP_SIZE, VideoFeatureExtrac
 from fusion.cross_attention import MultiModalFusionClassifier
 from utils.gradcam import DeepfakeGradCAM
 
-app = FastAPI(title="Deepfake Detector", version="2.0.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await _load_models()
+    yield
+
+app = FastAPI(title="Deepfake Detector", version="2.0.0", lifespan=lifespan)
 
 # ---------------------------------------------------------------------------
 # Globals
@@ -64,8 +70,7 @@ class _FusionScorer(nn.Module):
 # Startup
 # ---------------------------------------------------------------------------
 
-@app.on_event("startup")
-async def load_models():
+async def _load_models():
     global _img_ext, _aud_ext, _vid_ext, _head, _fusion, _device
     _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -97,7 +102,13 @@ async def load_models():
             _fusion.load_state_dict(fusion_state)
         val_info = f"  val_acc={state['val_acc']:.4f}" if "val_acc" in state else ""
         print(f"Loaded {ckpt_name} (epoch {state.get('epoch', '?')}){val_info}")
-        break
+        return
+
+    print(
+        "WARNING: No checkpoint found in checkpoints/. "
+        "API is running with random (untrained) weights — predictions are meaningless. "
+        "Train a model and place the checkpoint at checkpoints/best.pt."
+    )
 
 
 # ---------------------------------------------------------------------------

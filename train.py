@@ -149,8 +149,12 @@ def run_image_epoch(loader, img_ext, head, criterion, device, optimizer=None):
     with ctx:
         for frames, labels in loader:
             labels = labels.float().to(device)
-            B, T, C, H, W = frames.shape
-            emb = img_ext(frames.view(B * T, C, H, W).to(device)).view(B, T, -1).mean(1)
+            frames = frames.to(device)
+            if frames.ndim == 5:             # (B, T, C, H, W) — multi-frame
+                B, T, C, H, W = frames.shape
+                emb = img_ext(frames.view(B * T, C, H, W)).view(B, T, -1).mean(1)
+            else:                            # (B, C, H, W) — single image
+                emb = img_ext(frames)
             preds = head(emb).squeeze(1)
             loss = criterion(preds, labels)
             if training:
@@ -308,7 +312,11 @@ def parse_args():
     parser.add_argument("--manipulations",    nargs="+", default=None)
     parser.add_argument("--val_split",        type=float, default=0.2)
     parser.add_argument("--face_crop",        action="store_true")
+    parser.add_argument("--kaggle_root",      default=None,
+                        help="Path to 140k Real and Fake Faces dataset (image-only training).")
     # training
+    parser.add_argument("--fake_weight",      type=float, default=1.0,
+                        help="BCEWithLogitsLoss pos_weight for fake samples (>1.0 upweights fakes).")
     parser.add_argument("--epochs",           type=int, default=20)
     parser.add_argument("--batch_size",       type=int, default=8)
     parser.add_argument("--lr",               type=float, default=1e-4)
@@ -327,7 +335,8 @@ def parse_args():
 
 def main():
     args = parse_args()
-    n_sources = sum([bool(args.ffpp_root), bool(args.asvspoof_root), bool(args.embeddings_dir)])
+    n_sources = sum([bool(args.ffpp_root), bool(args.asvspoof_root),
+                     bool(args.embeddings_dir), bool(args.kaggle_root)])
     if n_sources == 0:
         raise ValueError("Provide one of: --ffpp_root, --asvspoof_root, --embeddings_dir")
     if n_sources > 1:
@@ -343,7 +352,8 @@ def main():
 
     try:
         print(f"Device: {device}")
-        criterion = nn.BCEWithLogitsLoss()
+        pos_w = torch.tensor([args.fake_weight], device=device) if args.fake_weight != 1.0 else None
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_w)
 
         # ---------------------------------------------------------------
         # Multimodal fusion path
@@ -496,6 +506,81 @@ def main():
                 aud_ext.load_state_dict(best_state["aud_extractor"])
                 head.load_state_dict(best_state["head"])
                 tst_loss, tst_acc = run_generic_epoch(test_loader, aud_ext, head, criterion, device)
+                print(f"Test: loss={tst_loss:.4f}  acc={tst_acc:.4f}")
+            return
+
+        # ---------------------------------------------------------------
+        # Kaggle 140k Real and Fake Faces path (image-only)
+        # ---------------------------------------------------------------
+        if args.kaggle_root:
+            from benchmarks.kaggle_faces import KaggleFacesDataset
+            train_ds = KaggleFacesDataset(args.kaggle_root, split="train",
+                                          transform=get_train_transforms(size=299))
+            val_ds   = KaggleFacesDataset(args.kaggle_root, split="val",
+                                          transform=get_val_transforms(size=299))
+            print(f"\nKaggle path | Train: {len(train_ds)}  Val: {len(val_ds)}")
+
+            train_loader = DataLoader(train_ds, batch_size=args.batch_size,
+                                      sampler=_make_sampler([lbl for _, lbl in train_ds.samples]),
+                                      num_workers=args.workers, pin_memory=True)
+            val_loader   = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
+                                      num_workers=args.workers, pin_memory=True)
+
+            img_ext   = ImageFeatureExtractor(pretrained=True).to(device)
+            head      = _make_head(device)
+            optimizer = AdamW([
+                {"params": img_ext.backbone.parameters(), "lr": args.lr * 0.1},
+                {"params": [p for n, p in img_ext.named_parameters() if "backbone" not in n],
+                 "lr": args.lr},
+                {"params": head.parameters(), "lr": args.lr},
+            ], weight_decay=1e-4)
+            scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
+
+            start_epoch, best_val_acc = 1, 0.0
+            if args.resume:
+                ckpt = torch.load(args.resume, map_location=device)
+                img_ext.load_state_dict(ckpt.get("img_extractor", {}), strict=False)
+                head.load_state_dict(ckpt.get("head", {}), strict=False)
+                if ckpt.get("optimizer"): optimizer.load_state_dict(ckpt["optimizer"])
+                if ckpt.get("scheduler"): scheduler.load_state_dict(ckpt["scheduler"])
+                start_epoch  = ckpt.get("epoch", 0) + 1
+                best_val_acc = ckpt.get("val_acc", 0.0)
+                print(f"Resumed from {args.resume} (epoch {start_epoch-1}, val_acc={best_val_acc:.4f})")
+
+            ckpt_path = os.path.join(args.checkpoint_dir, "best.pt")
+            print(f"LR head/srm={args.lr:.2e}  backbone={args.lr*0.1:.2e}")
+
+            epochs_no_improve = 0
+            for epoch in range(start_epoch, args.epochs + 1):
+                tr_loss, tr_acc = run_image_epoch(train_loader, img_ext, head, criterion, device, optimizer)
+                vl_loss, vl_acc = run_image_epoch(val_loader,   img_ext, head, criterion, device)
+                scheduler.step()
+                print(f"Epoch {epoch:3d}/{args.epochs}  "
+                      f"train_loss={tr_loss:.4f}  train_acc={tr_acc:.4f}  "
+                      f"val_loss={vl_loss:.4f}  val_acc={vl_acc:.4f}")
+                if vl_acc > best_val_acc:
+                    best_val_acc = vl_acc; epochs_no_improve = 0
+                    save_checkpoint(ckpt_path, epoch, vl_acc, vl_loss,
+                                    img_ext=img_ext, head=head,
+                                    optimizer=optimizer, scheduler=scheduler)
+                    print(f"  Saved {ckpt_path} (val_acc={vl_acc:.4f})")
+                else:
+                    epochs_no_improve += 1
+                    if epochs_no_improve >= args.patience:
+                        print(f"Early stopping at epoch {epoch}"); break
+
+            print(f"Done. Best val_acc: {best_val_acc:.4f}  ->  {ckpt_path}")
+
+            test_ds = KaggleFacesDataset(args.kaggle_root, split="test",
+                                          transform=get_val_transforms(size=299))
+            if len(test_ds) > 0:
+                print("\nTest evaluation...")
+                test_loader = DataLoader(test_ds, batch_size=args.batch_size,
+                                         shuffle=False, num_workers=args.workers)
+                best_state = torch.load(ckpt_path, map_location=device)
+                img_ext.load_state_dict(best_state["img_extractor"], strict=False)
+                head.load_state_dict(best_state["head"], strict=False)
+                tst_loss, tst_acc = run_image_epoch(test_loader, img_ext, head, criterion, device)
                 print(f"Test: loss={tst_loss:.4f}  acc={tst_acc:.4f}")
             return
 
