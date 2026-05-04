@@ -6,8 +6,12 @@ FF++ (per-manipulation breakdown):
                    --ffpp_root /data/FaceForensics++ --modality image
 
 ASVspoof:
-    python eval.py --checkpoint checkpoints/best.pt \\
+    python eval.py --checkpoint checkpoints/best_audio.pt \\
                    --asvspoof_root /data/ASVspoof2019 --modality audio
+
+Fusion (pre-extracted embeddings):
+    python eval.py --checkpoint checkpoints/best_fusion.pt \\
+                   --embeddings_dir embeddings/ --modality fusion
 
 Results are saved to results/eval_<timestamp>.json
 """
@@ -20,15 +24,15 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn as nn
 from sklearn.metrics import average_precision_score, roc_auc_score
 from torch.utils.data import DataLoader
-
-import torch.nn as nn
 
 from benchmarks.ff_plusplus import MANIPULATIONS, FaceForensicsDataset
 from detectors.audio.extractor import AudioFeatureExtractor
 from detectors.image.extractor import ImageFeatureExtractor
-from detectors.video.extractor import CLIP_FRAMES, VideoFeatureExtractor
+from detectors.video.extractor import CLIP_FRAMES, CLIP_SIZE, VideoFeatureExtractor
+from fusion.cross_attention import MultiModalFusionClassifier
 from utils.augmentations import get_val_transforms
 
 
@@ -67,9 +71,8 @@ def run_inference(loader, img_ext, aud_ext, vid_ext, head, device, modality):
 
     for inputs, labels in loader:
         inputs = inputs.to(device)
-
         if modality == "image":
-            if inputs.ndim == 5:                         # (B, T, C, H, W)
+            if inputs.ndim == 5:
                 B, T, C, H, W = inputs.shape
                 emb = img_ext(inputs.view(B * T, C, H, W)).view(B, T, -1).mean(1)
             else:
@@ -87,6 +90,44 @@ def run_inference(loader, img_ext, aud_ext, vid_ext, head, device, modality):
     return np.concatenate(all_scores), np.concatenate(all_labels)
 
 
+@torch.no_grad()
+def run_fusion_inference(embeddings_dir: str, split: str, fusion, device,
+                         batch_size: int) -> tuple:
+    """Load pre-extracted embeddings and score them through the fusion model."""
+    d = Path(embeddings_dir)
+    img_emb = aud_emb = vid_emb = None
+    labels = None
+
+    for mod in ("image", "audio", "video"):
+        p = d / f"{mod}_{split}.npz"
+        if not p.exists():
+            continue
+        data = np.load(p)
+        t = torch.from_numpy(data["embeddings"].astype(np.float32))
+        if mod == "image":   img_emb = t
+        elif mod == "audio": aud_emb = t
+        elif mod == "video": vid_emb = t
+        if labels is None:
+            labels = data["labels"].astype(np.int64)
+        print(f"  Loaded {p.name}  n={len(t)}")
+
+    if labels is None:
+        raise FileNotFoundError(f"No embeddings found in {d} for split={split}")
+
+    n = len(labels)
+    all_scores = []
+    fusion.eval()
+    for i in range(0, n, batch_size):
+        sl = slice(i, i + batch_size)
+        ie = img_emb[sl].to(device) if img_emb is not None else None
+        ae = aud_emb[sl].to(device) if aud_emb is not None else None
+        ve = vid_emb[sl].to(device) if vid_emb is not None else None
+        logits = fusion(img_emb=ie, aud_emb=ae, vid_emb=ve)
+        all_scores.append(torch.sigmoid(logits).squeeze(1).cpu().numpy())
+
+    return np.concatenate(all_scores), labels
+
+
 # ---------------------------------------------------------------------------
 # Evaluation routines
 # ---------------------------------------------------------------------------
@@ -96,7 +137,15 @@ def eval_ffpp(args, img_ext, aud_ext, vid_ext, head, device) -> dict:
     all_scores, all_labels = [], []
 
     fpv = CLIP_FRAMES if args.modality == "video" else args.frames_per_video
-    transform = get_val_transforms(size=299)
+
+    vid_tfm = None
+    if args.modality == "video":
+        from torchvision import transforms as T
+        vid_tfm = T.Compose([
+            T.Resize((CLIP_SIZE, CLIP_SIZE)),
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
 
     for manip in MANIPULATIONS:
         ds = FaceForensicsDataset(
@@ -105,7 +154,7 @@ def eval_ffpp(args, img_ext, aud_ext, vid_ext, head, device) -> dict:
             split=args.split,
             frames_per_video=fpv,
             manipulations=[manip],
-            transform=transform,
+            transform=vid_tfm if vid_tfm else get_val_transforms(size=299),
         )
         if len(ds) == 0:
             print(f"  [skip] {manip} — no data found")
@@ -121,21 +170,26 @@ def eval_ffpp(args, img_ext, aud_ext, vid_ext, head, device) -> dict:
         results["overall"] = compute_metrics(
             np.concatenate(all_labels), np.concatenate(all_scores)
         )
-
     return results
 
 
 def eval_asvspoof(args, img_ext, aud_ext, vid_ext, head, device) -> dict:
     from benchmarks.asvspoof import ASVspoofDataset
-
-    protocol = os.path.join(args.asvspoof_root, "protocol",
-                            "eval.txt" if args.split == "test" else f"{args.split}.txt")
+    proto_map = {"val": "dev.txt", "test": "eval.txt"}
+    protocol  = os.path.join(args.asvspoof_root, "protocol", proto_map[args.split])
     ds = ASVspoofDataset(
         audio_dir=os.path.join(args.asvspoof_root, "flac"),
         protocol_file=protocol,
     )
     loader = DataLoader(ds, batch_size=args.batch_size, num_workers=args.workers)
     scores, labels = run_inference(loader, img_ext, aud_ext, vid_ext, head, device, "audio")
+    return {"overall": compute_metrics(labels, scores)}
+
+
+def eval_fusion(args, fusion, device) -> dict:
+    scores, labels = run_fusion_inference(
+        args.embeddings_dir, args.split, fusion, device, args.batch_size
+    )
     return {"overall": compute_metrics(labels, scores)}
 
 
@@ -146,8 +200,7 @@ def eval_asvspoof(args, img_ext, aud_ext, vid_ext, head, device) -> dict:
 def print_table(results: dict, title: str):
     print(f"\n{title}")
     print("=" * 60)
-    header = f"{'Category':<20}  {'AUC':>6}  {'AP':>6}  {'EER':>6}  {'N':>6}"
-    print(header)
+    print(f"{'Category':<20}  {'AUC':>6}  {'AP':>6}  {'EER':>6}  {'N':>6}")
     print("-" * 60)
     for name, m in results.items():
         if name == "overall":
@@ -166,53 +219,75 @@ def print_table(results: dict, title: str):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint",      required=True)
-    parser.add_argument("--ffpp_root",       default=None)
-    parser.add_argument("--asvspoof_root",   default=None)
-    parser.add_argument("--modality",        choices=["image", "audio", "video"], default="image")
-    parser.add_argument("--split",           default="test", choices=["val", "test"])
-    parser.add_argument("--compression",     default="c23")
-    parser.add_argument("--frames_per_video",type=int, default=10)
-    parser.add_argument("--batch_size",      type=int, default=16)
-    parser.add_argument("--workers",         type=int, default=4)
-    parser.add_argument("--output_dir",      default="results")
+    parser.add_argument("--checkpoint",       required=True)
+    parser.add_argument("--ffpp_root",        default=None)
+    parser.add_argument("--asvspoof_root",    default=None)
+    parser.add_argument("--embeddings_dir",   default=None,
+                        help="Pre-extracted embeddings dir (required for --modality fusion).")
+    parser.add_argument("--modality",         choices=["image", "audio", "video", "fusion"],
+                        default="image")
+    parser.add_argument("--split",            default="test", choices=["val", "test"])
+    parser.add_argument("--compression",      default="c23")
+    parser.add_argument("--frames_per_video", type=int, default=10)
+    parser.add_argument("--batch_size",       type=int, default=16)
+    parser.add_argument("--workers",          type=int, default=4)
+    parser.add_argument("--output_dir",       default="results")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # Load models
-    img_ext = ImageFeatureExtractor(pretrained=False).to(device)
-    aud_ext = AudioFeatureExtractor(sample_rate=16000).to(device)
-    vid_ext = VideoFeatureExtractor(pretrained=False).to(device)
-
     state = torch.load(args.checkpoint, map_location=device)
-    img_ext.load_state_dict(state.get("img_extractor", {}), strict=False)
-    aud_ext.load_state_dict(state.get("aud_extractor", {}), strict=False)
-    vid_ext.load_state_dict(state.get("vid_extractor", {}), strict=False)
-
-    head_state = state.get("head", {})
-    head = nn.Sequential(
-        nn.Linear(512, 256), nn.ReLU(), nn.Dropout(0.4),
-        nn.Linear(256, 64),  nn.ReLU(), nn.Dropout(0.3),
-        nn.Linear(64, 1),
-    ).to(device)
-    if head_state:
-        head.load_state_dict(head_state, strict=False)
     val_info = f"  val_acc={state['val_acc']:.4f}" if "val_acc" in state else ""
-    print(f"Loaded checkpoint: {args.checkpoint}  (epoch {state.get('epoch', '?')}){val_info}")
+    print(f"Loaded: {args.checkpoint}  (epoch {state.get('epoch', '?')}){val_info}")
 
-    # Run evaluation
-    if args.ffpp_root:
-        results = eval_ffpp(args, img_ext, aud_ext, vid_ext, head, device)
-        title = f"FF++ | split={args.split} | compression={args.compression} | modality={args.modality}"
+    # ------------------------------------------------------------------
+    # Fusion evaluation (embeddings path)
+    # ------------------------------------------------------------------
+    if args.modality == "fusion":
+        if not args.embeddings_dir:
+            parser.error("--embeddings_dir required for --modality fusion")
+        fusion_state = state.get("fusion", {})
+        if not fusion_state:
+            parser.error("Checkpoint has no fusion weights. "
+                         "Train with --embeddings_dir first.")
+        fusion = MultiModalFusionClassifier().to(device)
+        fusion.load_state_dict(fusion_state)
+        results = eval_fusion(args, fusion, device)
+        title = (f"Fusion | split={args.split} | "
+                 f"embeddings={args.embeddings_dir}")
         print_table(results, title)
-    elif args.asvspoof_root:
-        results = eval_asvspoof(args, img_ext, aud_ext, vid_ext, head, device)
-        title = f"ASVspoof | split={args.split} | modality=audio"
-        print_table(results, title)
+
+    # ------------------------------------------------------------------
+    # Single-modality evaluation
+    # ------------------------------------------------------------------
     else:
-        parser.error("Provide --ffpp_root or --asvspoof_root")
+        img_ext = ImageFeatureExtractor(pretrained=False).to(device)
+        aud_ext = AudioFeatureExtractor(sample_rate=16000).to(device)
+        vid_ext = VideoFeatureExtractor(pretrained=False).to(device)
+        head    = nn.Sequential(
+            nn.Linear(512, 256), nn.ReLU(), nn.Dropout(0.4),
+            nn.Linear(256, 64),  nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(64, 1),
+        ).to(device)
+
+        img_ext.load_state_dict(state.get("img_extractor", {}), strict=False)
+        aud_ext.load_state_dict(state.get("aud_extractor", {}), strict=False)
+        vid_ext.load_state_dict(state.get("vid_extractor", {}), strict=False)
+        if state.get("head"):
+            head.load_state_dict(state["head"], strict=False)
+
+        if args.ffpp_root:
+            results = eval_ffpp(args, img_ext, aud_ext, vid_ext, head, device)
+            title = (f"FF++ | split={args.split} | compression={args.compression} "
+                     f"| modality={args.modality}")
+            print_table(results, title)
+        elif args.asvspoof_root:
+            results = eval_asvspoof(args, img_ext, aud_ext, vid_ext, head, device)
+            title = f"ASVspoof | split={args.split} | modality=audio"
+            print_table(results, title)
+        else:
+            parser.error("Provide --ffpp_root, --asvspoof_root, or --embeddings_dir")
 
     # Save JSON
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)

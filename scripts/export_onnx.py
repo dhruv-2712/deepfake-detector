@@ -141,6 +141,29 @@ def main():
         opset=args.opset,
     )
 
+    # -----------------------------------------------------------------------
+    # Fusion classifier
+    # -----------------------------------------------------------------------
+    from fusion.cross_attention import MultiModalFusionClassifier
+    fusion = MultiModalFusionClassifier()
+    fusion_state = state.get("fusion", {})
+    if fusion_state:
+        fusion.load_state_dict(fusion_state)
+    fusion.eval()
+    print("\nExporting fusion classifier...")
+    try_export(
+        fusion,
+        (torch.zeros(1, 512), torch.zeros(1, 512), torch.zeros(1, 512)),
+        out / "fusion.onnx",
+        input_names=["img_emb", "aud_emb", "vid_emb"],
+        output_names=["logit"],
+        dynamic_axes={
+            "img_emb": {0: "batch"}, "aud_emb": {0: "batch"},
+            "vid_emb": {0: "batch"}, "logit":   {0: "batch"},
+        },
+        opset=args.opset,
+    )
+
     print(f"\nAll exports attempted → {out}/")
 
 

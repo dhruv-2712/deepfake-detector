@@ -139,6 +139,13 @@ def main():
             )
             if args.modality == "image":
                 ds_kwargs["transform"] = get_val_transforms(size=299)
+            elif args.modality == "video":
+                from torchvision import transforms as _T
+                ds_kwargs["transform"] = _T.Compose([
+                    _T.Resize((CLIP_SIZE, CLIP_SIZE)),
+                    _T.ToTensor(),
+                    _T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                ])
             ds_kwargs["use_face_crop"] = args.face_crop
             ds = FaceForensicsDataset(args.ffpp_root, **ds_kwargs)
         else:
