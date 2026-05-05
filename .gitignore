@@ -31,3 +31,6 @@ face_detection_out.jpg
 
 # OMC internal state
 .omc/
+
+# Claude Code session data
+.claude/

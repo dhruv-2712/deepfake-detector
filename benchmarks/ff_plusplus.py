@@ -62,9 +62,9 @@ class FaceForensicsDataset(Dataset):
         self.manipulations = manipulations or MANIPULATIONS
         self.random_frames = random_frames
         self.transform = transform if transform is not None else transforms.Compose([
-            transforms.Resize((224, 224)),
+            transforms.Resize((299, 299)),
             transforms.ToTensor(),
-            _NORMALIZE,
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
         ])
 
         self._detector = None

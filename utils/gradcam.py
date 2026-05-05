@@ -14,23 +14,49 @@ from PIL import Image
 
 def _resolve_target_layer(img_ext):
     """
-    Return the best target layer for Grad-CAM.
+    Return the last spatially-rich layer for Grad-CAM.
+
+    We need a layer whose output is (B, C, H, W) with H, W > 1, so
+    that the spatial average of gradients is meaningful.
 
     Priority:
-      1. XceptionNet attributes: act5, bn5, conv5
-      2. EfficientNet fallback: backbone.blocks[-1]
-      3. Generic fallback: second-to-last child module
+      1. legacy_xception via timm: backbone.block12 (last middle-flow block)
+      2. Any named block* module on the backbone (largest index wins)
+      3. EfficientNet: backbone.blocks[-1]
+      4. Last Conv2d found by walking the backbone's named modules
     """
     backbone = getattr(img_ext, "backbone", img_ext)
-    for attr in ("act5", "bn5", "conv5"):
-        if hasattr(backbone, attr):
-            return getattr(backbone, attr)
+
+    # 1. timm legacy_xception: block12 is the last middle-flow separable block
+    if hasattr(backbone, "block12"):
+        return backbone.block12
+
+    # 2. Any backbone with numbered block attributes (block0..blockN)
+    block_layers = [
+        (name, mod)
+        for name, mod in backbone.named_children()
+        if name.startswith("block")
+    ]
+    if block_layers:
+        # highest-numbered block
+        block_layers.sort(key=lambda t: t[0])
+        return block_layers[-1][1]
+
+    # 3. EfficientNet / similar: backbone.blocks sequence
     if hasattr(backbone, "blocks"):
         return backbone.blocks[-1]
-    children = list(img_ext.children())
-    if len(children) >= 2:
-        return children[-2]
-    return children[-1]
+
+    # 4. Generic fallback: last Conv2d in the backbone
+    last_conv = None
+    for mod in backbone.modules():
+        if isinstance(mod, torch.nn.Conv2d):
+            last_conv = mod
+    if last_conv is not None:
+        return last_conv
+
+    # 5. Ultimate fallback
+    children = list(backbone.children())
+    return children[-2] if len(children) >= 2 else children[-1]
 
 
 class DeepfakeGradCAM:
@@ -75,11 +101,19 @@ class DeepfakeGradCAM:
         acts  = self._acts   # (1, C, H, W)
         grads = self._grads  # (1, C, H, W) or None
 
-        if grads is not None:
+        # Guard: we need 4-D spatial tensors for the weighted sum.
+        # If the hooked layer squeezed spatial dims (e.g. 1×1 after GAP),
+        # fall back to the activation-mean path.
+        has_spatial = acts is not None and acts.ndim == 4 and acts.shape[2] > 1
+
+        if has_spatial and grads is not None and grads.ndim == 4:
             weights = grads.mean(dim=(2, 3), keepdim=True)   # (1, C, 1, 1)
             cam = (weights * acts).sum(dim=1, keepdim=True)   # (1, 1, H, W)
-        else:
+        elif has_spatial:
             cam = acts.mean(dim=1, keepdim=True)              # activation fallback
+        else:
+            # Last resort: return a flat zero heatmap
+            cam = torch.zeros(1, 1, 10, 10)
 
         cam = torch.relu(cam).squeeze()                       # (H, W)
         if cam.max() > 0:
