@@ -14,7 +14,7 @@ Multimodal fusion (pre-extracted embeddings):
     python train.py --embeddings_dir embeddings/
 
 Resume any run:
-    python train.py ... --resume checkpoints/best.pt
+    python train.py ... --resume checkpoints/last.pt
 """
 
 import argparse
@@ -27,7 +27,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision import transforms as T
 
@@ -140,7 +140,12 @@ def _dropout_modalities(img, aud, vid, p):
     return tuple(mods)
 
 
-def run_image_epoch(loader, img_ext, head, criterion, device, optimizer=None):
+def _clip_grads(optimizer, max_norm=1.0):
+    params = [p for pg in optimizer.param_groups for p in pg['params']]
+    nn.utils.clip_grad_norm_(params, max_norm)
+
+
+def run_image_epoch(loader, img_ext, head, criterion, device, optimizer=None, clip_grad=1.0):
     training = optimizer is not None
     img_ext.train(training)
     head.train(training)
@@ -158,14 +163,17 @@ def run_image_epoch(loader, img_ext, head, criterion, device, optimizer=None):
             preds = head(emb).squeeze(1)
             loss = criterion(preds, labels)
             if training:
-                optimizer.zero_grad(); loss.backward(); optimizer.step()
+                optimizer.zero_grad()
+                loss.backward()
+                _clip_grads(optimizer, clip_grad)
+                optimizer.step()
             total_loss += loss.item() * len(labels)
             correct    += ((preds >= 0).float() == labels).sum().item()
             total      += len(labels)
     return total_loss / total, correct / total
 
 
-def run_video_epoch(loader, vid_ext, head, criterion, device, optimizer=None):
+def run_video_epoch(loader, vid_ext, head, criterion, device, optimizer=None, clip_grad=1.0):
     training = optimizer is not None
     vid_ext.train(training)
     head.train(training)
@@ -178,14 +186,17 @@ def run_video_epoch(loader, vid_ext, head, criterion, device, optimizer=None):
             preds = head(emb).squeeze(1)
             loss = criterion(preds, labels)
             if training:
-                optimizer.zero_grad(); loss.backward(); optimizer.step()
+                optimizer.zero_grad()
+                loss.backward()
+                _clip_grads(optimizer, clip_grad)
+                optimizer.step()
             total_loss += loss.item() * len(labels)
             correct    += ((preds >= 0).float() == labels).sum().item()
             total      += len(labels)
     return total_loss / total, correct / total
 
 
-def run_generic_epoch(loader, extractor, head, criterion, device, optimizer=None):
+def run_generic_epoch(loader, extractor, head, criterion, device, optimizer=None, clip_grad=1.0):
     """Generic epoch for single-input extractors (audio)."""
     training = optimizer is not None
     extractor.train(training)
@@ -199,7 +210,10 @@ def run_generic_epoch(loader, extractor, head, criterion, device, optimizer=None
             preds = head(emb).squeeze(1)
             loss = criterion(preds, labels)
             if training:
-                optimizer.zero_grad(); loss.backward(); optimizer.step()
+                optimizer.zero_grad()
+                loss.backward()
+                _clip_grads(optimizer, clip_grad)
+                optimizer.step()
             total_loss += loss.item() * len(labels)
             correct    += ((preds >= 0).float() == labels).sum().item()
             total      += len(labels)
@@ -207,7 +221,8 @@ def run_generic_epoch(loader, extractor, head, criterion, device, optimizer=None
 
 
 def run_fusion_epoch(loader, fusion, criterion, device, optimizer=None,
-                     has_img=True, has_aud=True, has_vid=True, mod_dropout=0.15):
+                     has_img=True, has_aud=True, has_vid=True, mod_dropout=0.15,
+                     clip_grad=1.0):
     training = optimizer is not None
     fusion.train(training)
     total_loss = correct = total = 0
@@ -225,7 +240,10 @@ def run_fusion_epoch(loader, fusion, criterion, device, optimizer=None,
             preds = fusion(img_emb=img_emb, aud_emb=aud_emb, vid_emb=vid_emb).squeeze(1)
             loss = criterion(preds, labels)
             if training:
-                optimizer.zero_grad(); loss.backward(); optimizer.step()
+                optimizer.zero_grad()
+                loss.backward()
+                _clip_grads(optimizer, clip_grad)
+                optimizer.step()
             total_loss += loss.item() * len(labels)
             correct    += ((preds >= 0).float() == labels).sum().item()
             total      += len(labels)
@@ -268,30 +286,15 @@ def _make_head(device):
     ).to(device)
 
 
-def _early_stop_loop(train_fn, val_fn, optimizer, scheduler, args,
-                     ckpt_path, save_fn, start_epoch=1, best_val_acc=0.0):
-    """Shared early-stopping training loop. train_fn/val_fn() → (loss, acc)."""
-    epochs_no_improve = 0
-    for epoch in range(start_epoch, args.epochs + 1):
-        tr_loss, tr_acc = train_fn(epoch)
-        vl_loss, vl_acc = val_fn(epoch)
-        scheduler.step()
-        print(
-            f"Epoch {epoch:3d}/{args.epochs}  "
-            f"train_loss={tr_loss:.4f}  train_acc={tr_acc:.4f}  "
-            f"val_loss={vl_loss:.4f}  val_acc={vl_acc:.4f}"
-        )
-        if vl_acc > best_val_acc:
-            best_val_acc = vl_acc
-            epochs_no_improve = 0
-            save_fn(ckpt_path, epoch, vl_acc, vl_loss, optimizer, scheduler)
-            print(f"  Saved {ckpt_path} (val_acc={vl_acc:.4f})")
-        else:
-            epochs_no_improve += 1
-            if epochs_no_improve >= args.patience:
-                print(f"Early stopping at epoch {epoch}")
-                break
-    return best_val_acc
+def _make_scheduler(optimizer, args):
+    """Linear warmup then cosine annealing. Falls back to plain cosine if warmup=0."""
+    if args.warmup_epochs > 0 and args.epochs > args.warmup_epochs:
+        warmup = LinearLR(optimizer, start_factor=0.1, end_factor=1.0,
+                          total_iters=args.warmup_epochs)
+        cosine = CosineAnnealingLR(optimizer, T_max=args.epochs - args.warmup_epochs)
+        return SequentialLR(optimizer, schedulers=[warmup, cosine],
+                            milestones=[args.warmup_epochs])
+    return CosineAnnealingLR(optimizer, T_max=args.epochs)
 
 
 # ---------------------------------------------------------------------------
@@ -317,12 +320,18 @@ def parse_args():
     # training
     parser.add_argument("--fake_weight",      type=float, default=1.0,
                         help="BCEWithLogitsLoss pos_weight for fake samples (>1.0 upweights fakes).")
-    parser.add_argument("--epochs",           type=int, default=20)
+    parser.add_argument("--epochs",           type=int, default=30)
     parser.add_argument("--batch_size",       type=int, default=8)
     parser.add_argument("--lr",               type=float, default=1e-4)
     parser.add_argument("--workers",          type=int, default=0)
     parser.add_argument("--checkpoint_dir",   default="checkpoints")
-    parser.add_argument("--patience",         type=int, default=5)
+    parser.add_argument("--patience",         type=int, default=7)
+    parser.add_argument("--warmup_epochs",    type=int, default=3,
+                        help="Linear warmup epochs before cosine annealing kicks in.")
+    parser.add_argument("--save_every",       type=int, default=5,
+                        help="Save a periodic checkpoint every N epochs (0 to disable).")
+    parser.add_argument("--clip_grad",        type=float, default=1.0,
+                        help="Max gradient norm for clipping (0 to disable).")
     parser.add_argument("--mod_dropout",      type=float, default=0.15)
     parser.add_argument("--resume",           default=None,
                         help="Checkpoint path to resume training from.")
@@ -378,7 +387,7 @@ def main():
 
             fusion    = MultiModalFusionClassifier().to(device)
             optimizer = AdamW(fusion.parameters(), lr=args.lr, weight_decay=1e-4)
-            scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
+            scheduler = _make_scheduler(optimizer, args)
 
             start_epoch, best_val_acc = 1, 0.0
             if args.resume:
@@ -390,15 +399,17 @@ def main():
                 best_val_acc = ckpt.get("val_acc", 0.0)
                 print(f"Resumed from {args.resume} (epoch {start_epoch-1}, val_acc={best_val_acc:.4f})")
 
-            ckpt_path = os.path.join(args.checkpoint_dir, "best_fusion.pt")
-            print(f"LR={args.lr:.2e}  Params: {sum(p.numel() for p in fusion.parameters()):,}")
+            ckpt_path  = os.path.join(args.checkpoint_dir, "best_fusion.pt")
+            last_path  = os.path.join(args.checkpoint_dir, "last_fusion.pt")
+            print(f"LR={args.lr:.2e}  warmup={args.warmup_epochs}ep  patience={args.patience}")
+            print(f"Params: {sum(p.numel() for p in fusion.parameters()):,}")
 
             epochs_no_improve = 0
             for epoch in range(start_epoch, args.epochs + 1):
                 tr_loss, tr_acc = run_fusion_epoch(
                     train_loader, fusion, criterion, device, optimizer,
                     has_img=has_img, has_aud=has_aud, has_vid=has_vid,
-                    mod_dropout=args.mod_dropout)
+                    mod_dropout=args.mod_dropout, clip_grad=args.clip_grad)
                 vl_loss, vl_acc = run_fusion_epoch(
                     val_loader, fusion, criterion, device,
                     has_img=has_img, has_aud=has_aud, has_vid=has_vid)
@@ -406,6 +417,13 @@ def main():
                 print(f"Epoch {epoch:3d}/{args.epochs}  "
                       f"train_loss={tr_loss:.4f}  train_acc={tr_acc:.4f}  "
                       f"val_loss={vl_loss:.4f}  val_acc={vl_acc:.4f}")
+                save_checkpoint(last_path, epoch, vl_acc, vl_loss,
+                                fusion=fusion, optimizer=optimizer, scheduler=scheduler)
+                if args.save_every > 0 and epoch % args.save_every == 0:
+                    periodic = os.path.join(args.checkpoint_dir, f"fusion_epoch{epoch:03d}.pt")
+                    save_checkpoint(periodic, epoch, vl_acc, vl_loss,
+                                    fusion=fusion, optimizer=optimizer, scheduler=scheduler)
+                    print(f"  Periodic save -> {periodic}")
                 if vl_acc > best_val_acc:
                     best_val_acc = vl_acc; epochs_no_improve = 0
                     save_checkpoint(ckpt_path, epoch, vl_acc, vl_loss,
@@ -459,7 +477,7 @@ def main():
                  "lr": args.lr},
                 {"params": head.parameters(), "lr": args.lr},
             ], weight_decay=1e-4)
-            scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
+            scheduler = _make_scheduler(optimizer, args)
 
             start_epoch, best_val_acc = 1, 0.0
             if args.resume:
@@ -473,16 +491,27 @@ def main():
                 print(f"Resumed from {args.resume} (epoch {start_epoch-1}, val_acc={best_val_acc:.4f})")
 
             ckpt_path = os.path.join(args.checkpoint_dir, "best_audio.pt")
-            print(f"LR head={args.lr:.2e}  lcnn={args.lr*0.1:.2e}")
+            last_path = os.path.join(args.checkpoint_dir, "last_audio.pt")
+            print(f"LR head={args.lr:.2e}  lcnn={args.lr*0.1:.2e}  warmup={args.warmup_epochs}ep")
 
             epochs_no_improve = 0
             for epoch in range(start_epoch, args.epochs + 1):
-                tr_loss, tr_acc = run_generic_epoch(train_loader, aud_ext, head, criterion, device, optimizer)
+                tr_loss, tr_acc = run_generic_epoch(train_loader, aud_ext, head, criterion, device,
+                                                    optimizer, clip_grad=args.clip_grad)
                 vl_loss, vl_acc = run_generic_epoch(val_loader,   aud_ext, head, criterion, device)
                 scheduler.step()
                 print(f"Epoch {epoch:3d}/{args.epochs}  "
                       f"train_loss={tr_loss:.4f}  train_acc={tr_acc:.4f}  "
                       f"val_loss={vl_loss:.4f}  val_acc={vl_acc:.4f}")
+                save_checkpoint(last_path, epoch, vl_acc, vl_loss,
+                                aud_ext=aud_ext, head=head,
+                                optimizer=optimizer, scheduler=scheduler)
+                if args.save_every > 0 and epoch % args.save_every == 0:
+                    periodic = os.path.join(args.checkpoint_dir, f"audio_epoch{epoch:03d}.pt")
+                    save_checkpoint(periodic, epoch, vl_acc, vl_loss,
+                                    aud_ext=aud_ext, head=head,
+                                    optimizer=optimizer, scheduler=scheduler)
+                    print(f"  Periodic save -> {periodic}")
                 if vl_acc > best_val_acc:
                     best_val_acc = vl_acc; epochs_no_improve = 0
                     save_checkpoint(ckpt_path, epoch, vl_acc, vl_loss,
@@ -534,7 +563,7 @@ def main():
                  "lr": args.lr},
                 {"params": head.parameters(), "lr": args.lr},
             ], weight_decay=1e-4)
-            scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
+            scheduler = _make_scheduler(optimizer, args)
 
             start_epoch, best_val_acc = 1, 0.0
             if args.resume:
@@ -548,16 +577,27 @@ def main():
                 print(f"Resumed from {args.resume} (epoch {start_epoch-1}, val_acc={best_val_acc:.4f})")
 
             ckpt_path = os.path.join(args.checkpoint_dir, "best.pt")
-            print(f"LR head/srm={args.lr:.2e}  backbone={args.lr*0.1:.2e}")
+            last_path = os.path.join(args.checkpoint_dir, "last.pt")
+            print(f"LR head/srm={args.lr:.2e}  backbone={args.lr*0.1:.2e}  warmup={args.warmup_epochs}ep")
 
             epochs_no_improve = 0
             for epoch in range(start_epoch, args.epochs + 1):
-                tr_loss, tr_acc = run_image_epoch(train_loader, img_ext, head, criterion, device, optimizer)
+                tr_loss, tr_acc = run_image_epoch(train_loader, img_ext, head, criterion, device,
+                                                  optimizer, clip_grad=args.clip_grad)
                 vl_loss, vl_acc = run_image_epoch(val_loader,   img_ext, head, criterion, device)
                 scheduler.step()
                 print(f"Epoch {epoch:3d}/{args.epochs}  "
                       f"train_loss={tr_loss:.4f}  train_acc={tr_acc:.4f}  "
                       f"val_loss={vl_loss:.4f}  val_acc={vl_acc:.4f}")
+                save_checkpoint(last_path, epoch, vl_acc, vl_loss,
+                                img_ext=img_ext, head=head,
+                                optimizer=optimizer, scheduler=scheduler)
+                if args.save_every > 0 and epoch % args.save_every == 0:
+                    periodic = os.path.join(args.checkpoint_dir, f"epoch{epoch:03d}.pt")
+                    save_checkpoint(periodic, epoch, vl_acc, vl_loss,
+                                    img_ext=img_ext, head=head,
+                                    optimizer=optimizer, scheduler=scheduler)
+                    print(f"  Periodic save -> {periodic}")
                 if vl_acc > best_val_acc:
                     best_val_acc = vl_acc; epochs_no_improve = 0
                     save_checkpoint(ckpt_path, epoch, vl_acc, vl_loss,
@@ -643,7 +683,7 @@ def main():
                 {"params": head.parameters(), "lr": args.lr},
             ], weight_decay=1e-4)
 
-        scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
+        scheduler = _make_scheduler(optimizer, args)
 
         start_epoch, best_val_acc = 1, 0.0
         if args.resume:
@@ -659,26 +699,37 @@ def main():
             print(f"Resumed from {args.resume} (epoch {start_epoch-1}, val_acc={best_val_acc:.4f})")
 
         if is_video:
-            print(f"LR proj/head={args.lr:.2e}  R3D-18 layers={args.lr*0.1:.2e}")
+            print(f"LR proj/head={args.lr:.2e}  R3D-18 layers={args.lr*0.1:.2e}  warmup={args.warmup_epochs}ep")
         else:
-            print(f"LR head/srm={args.lr:.2e}  backbone={args.lr*0.1:.2e}")
+            print(f"LR head/srm={args.lr:.2e}  backbone={args.lr*0.1:.2e}  warmup={args.warmup_epochs}ep")
 
         ckpt_name = "best_video.pt" if is_video else "best.pt"
+        last_name = "last_video.pt" if is_video else "last.pt"
         ckpt_path = os.path.join(args.checkpoint_dir, ckpt_name)
+        last_path = os.path.join(args.checkpoint_dir, last_name)
+        pfx       = "video" if is_video else "epoch"
         run_epoch = run_video_epoch if is_video else run_image_epoch
         ext       = vid_ext if is_video else img_ext
 
         epochs_no_improve = 0
         for epoch in range(start_epoch, args.epochs + 1):
-            tr_loss, tr_acc = run_epoch(train_loader, ext, head, criterion, device, optimizer)
+            tr_loss, tr_acc = run_epoch(train_loader, ext, head, criterion, device,
+                                        optimizer, clip_grad=args.clip_grad)
             vl_loss, vl_acc = run_epoch(val_loader,   ext, head, criterion, device)
             scheduler.step()
             print(f"Epoch {epoch:3d}/{args.epochs}  "
                   f"train_loss={tr_loss:.4f}  train_acc={tr_acc:.4f}  "
                   f"val_loss={vl_loss:.4f}  val_acc={vl_acc:.4f}")
+            save_kw = dict(vid_ext=ext, head=head) if is_video else dict(img_ext=ext, head=head)
+            save_checkpoint(last_path, epoch, vl_acc, vl_loss,
+                            optimizer=optimizer, scheduler=scheduler, **save_kw)
+            if args.save_every > 0 and epoch % args.save_every == 0:
+                periodic = os.path.join(args.checkpoint_dir, f"{pfx}{epoch:03d}.pt")
+                save_checkpoint(periodic, epoch, vl_acc, vl_loss,
+                                optimizer=optimizer, scheduler=scheduler, **save_kw)
+                print(f"  Periodic save -> {periodic}")
             if vl_acc > best_val_acc:
                 best_val_acc = vl_acc; epochs_no_improve = 0
-                save_kw = dict(vid_ext=ext, head=head) if is_video else dict(img_ext=ext, head=head)
                 save_checkpoint(ckpt_path, epoch, vl_acc, vl_loss,
                                 optimizer=optimizer, scheduler=scheduler, **save_kw)
                 print(f"  Saved {ckpt_path} (val_acc={vl_acc:.4f})")
