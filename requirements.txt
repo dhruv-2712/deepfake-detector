@@ -14,6 +14,5 @@ tqdm>=4.65.0
 facenet-pytorch>=2.5.3
 onnx>=1.14.0
 onnxruntime>=1.15.0
-gradio>=4.0.0
 huggingface_hub>=0.20.0
 python-multipart>=0.0.9
