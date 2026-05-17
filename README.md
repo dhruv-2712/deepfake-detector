@@ -53,25 +53,41 @@ Covers all five FF++ manipulation types: Deepfakes, Face2Face, FaceSwap, NeuralT
 ## Project Structure
 
 ```
-detectors/
-  image/extractor.py       # XceptionNet backbone + SRM residual filters
-  audio/extractor.py       # LFCC feature extraction + LCNN classifier
-  video/extractor.py       # R3D-18 3D CNN temporal extractor
-fusion/
-  cross_attention.py       # Multi-head cross-attention fusion + MLP head
-benchmarks/
-  ff_plusplus.py           # FaceForensics++ dataset loader (video-based)
-  kaggle_faces.py          # 140k Real and Fake Faces loader (JPEG-based)
-  asvspoof.py              # ASVspoof 2019 audio dataset loader
-utils/
-  face_align.py            # MTCNN face detection and alignment
-  gradcam.py               # Grad-CAM heatmap over XceptionNet backbone
-  augmentations.py         # JPEG compression, noise, flip augmentations
-api/main.py                # FastAPI REST API
-demo.py                    # Gradio web demo
-train.py                   # Training script (image / audio / video / fusion)
-eval.py                    # Evaluation script (AUC, AP, EER)
-extract_frames.py          # One-time frame extraction from FF++ videos to JPEG
+deepfake-detector/
+│
+├── detectors/                  # Feature extractors (one per modality)
+│   ├── image/
+│   │   └── extractor.py        # XceptionNet + SRM residual noise filters
+│   ├── audio/
+│   │   └── extractor.py        # LFCC features + LCNN classifier
+│   └── video/
+│       └── extractor.py        # R3D-18 3D CNN temporal extractor
+│
+├── fusion/
+│   └── cross_attention.py      # Multi-head cross-attention + MLP fusion head
+│
+├── benchmarks/                 # Dataset loaders
+│   ├── ff_plusplus.py          # FaceForensics++ (video-based)
+│   ├── kaggle_faces.py         # 140k Real and Fake Faces (JPEG-based)
+│   └── asvspoof.py             # ASVspoof 2019 (audio)
+│
+├── utils/
+│   ├── face_align.py           # MTCNN face detection and alignment
+│   ├── gradcam.py              # Grad-CAM heatmap over XceptionNet
+│   └── augmentations.py        # JPEG, noise, and flip augmentations
+│
+├── scripts/
+│   ├── preextract.py           # Pre-extract embeddings to disk
+│   └── export_onnx.py          # Export models to ONNX
+│
+├── api/
+│   └── main.py                 # FastAPI REST endpoints
+│
+├── train.py                    # Training script
+├── eval.py                     # Evaluation (AUC, AP, EER)
+├── demo.py                     # Gradio web demo
+├── extract_frames.py           # One-time FF++ video → JPEG extraction
+└── app.py                      # HuggingFace Spaces entry point
 ```
 
 ---
