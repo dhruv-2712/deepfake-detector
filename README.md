@@ -1,3 +1,14 @@
+---
+title: Deepfake Detector
+emoji: 🎭
+colorFrom: red
+colorTo: blue
+sdk: gradio
+sdk_version: 4.0.0
+app_file: app.py
+pinned: false
+---
+
 # Deepfake Detector
 
 A multimodal deepfake detection system that analyses images, audio, and video to classify media as real or AI-generated.

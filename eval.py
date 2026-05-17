@@ -66,7 +66,8 @@ def compute_metrics(labels: np.ndarray, scores: np.ndarray) -> dict:
 @torch.no_grad()
 def run_inference(loader, img_ext, aud_ext, vid_ext, head, device, modality):
     for m in (img_ext, aud_ext, vid_ext, head):
-        m.eval()
+        if m is not None:
+            m.eval()
     all_scores, all_labels = [], []
 
     for inputs, labels in loader:
@@ -186,6 +187,19 @@ def eval_asvspoof(args, img_ext, aud_ext, vid_ext, head, device) -> dict:
     return {"overall": compute_metrics(labels, scores)}
 
 
+def eval_kaggle(args, img_ext, head, device) -> dict:
+    from benchmarks.kaggle_faces import KaggleFacesDataset
+    from utils.augmentations import get_val_transforms
+    ds = KaggleFacesDataset(args.kaggle_root, split="test",
+                            transform=get_val_transforms(size=299))
+    if len(ds) == 0:
+        print("[WARN] No test images found in kaggle_root")
+        return {}
+    loader = DataLoader(ds, batch_size=args.batch_size, num_workers=args.workers)
+    scores, labels = run_inference(loader, img_ext, None, None, head, device, "image")
+    return {"overall": compute_metrics(labels, scores)}
+
+
 def eval_fusion(args, fusion, device) -> dict:
     scores, labels = run_fusion_inference(
         args.embeddings_dir, args.split, fusion, device, args.batch_size
@@ -222,6 +236,8 @@ def main():
     parser.add_argument("--checkpoint",       required=True)
     parser.add_argument("--ffpp_root",        default=None)
     parser.add_argument("--asvspoof_root",    default=None)
+    parser.add_argument("--kaggle_root",      default=None,
+                        help="Path to extracted JPEG frames (ffpp_frames or kaggle-faces).")
     parser.add_argument("--embeddings_dir",   default=None,
                         help="Pre-extracted embeddings dir (required for --modality fusion).")
     parser.add_argument("--modality",         choices=["image", "audio", "video", "fusion"],
@@ -286,8 +302,11 @@ def main():
             results = eval_asvspoof(args, img_ext, aud_ext, vid_ext, head, device)
             title = f"ASVspoof | split={args.split} | modality=audio"
             print_table(results, title)
+        elif args.kaggle_root:
+            results = eval_kaggle(args, img_ext, head, device)
+            print_table(results, "Kaggle frames | split=test | modality=image")
         else:
-            parser.error("Provide --ffpp_root, --asvspoof_root, or --embeddings_dir")
+            parser.error("Provide --ffpp_root, --asvspoof_root, --kaggle_root, or --embeddings_dir")
 
     # Save JSON
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)

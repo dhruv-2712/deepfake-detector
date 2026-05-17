@@ -145,11 +145,20 @@ def _clip_grads(optimizer, max_norm=1.0):
     nn.utils.clip_grad_norm_(params, max_norm)
 
 
+def _balanced_acc(n_class, correct_class):
+    """(TPR + TNR) / 2 — robust to class imbalance."""
+    return 0.5 * sum(
+        correct_class[c] / n_class[c] if n_class[c] > 0 else 0.0
+        for c in [0, 1]
+    )
+
+
 def run_image_epoch(loader, img_ext, head, criterion, device, optimizer=None, clip_grad=1.0):
     training = optimizer is not None
     img_ext.train(training)
     head.train(training)
-    total_loss = correct = total = 0
+    total_loss = total = 0
+    n_class = [0, 0]; correct_class = [0, 0]
     ctx = torch.enable_grad() if training else torch.no_grad()
     with ctx:
         for frames, labels in loader:
@@ -168,16 +177,21 @@ def run_image_epoch(loader, img_ext, head, criterion, device, optimizer=None, cl
                 _clip_grads(optimizer, clip_grad)
                 optimizer.step()
             total_loss += loss.item() * len(labels)
-            correct    += ((preds >= 0).float() == labels).sum().item()
             total      += len(labels)
-    return total_loss / total, correct / total
+            for c in [0, 1]:
+                mask = labels == c
+                if mask.any():
+                    n_class[c]      += mask.sum().item()
+                    correct_class[c] += ((preds[mask] >= 0).float() == labels[mask]).sum().item()
+    return total_loss / total, _balanced_acc(n_class, correct_class)
 
 
 def run_video_epoch(loader, vid_ext, head, criterion, device, optimizer=None, clip_grad=1.0):
     training = optimizer is not None
     vid_ext.train(training)
     head.train(training)
-    total_loss = correct = total = 0
+    total_loss = total = 0
+    n_class = [0, 0]; correct_class = [0, 0]
     ctx = torch.enable_grad() if training else torch.no_grad()
     with ctx:
         for clips, labels in loader:
@@ -191,9 +205,13 @@ def run_video_epoch(loader, vid_ext, head, criterion, device, optimizer=None, cl
                 _clip_grads(optimizer, clip_grad)
                 optimizer.step()
             total_loss += loss.item() * len(labels)
-            correct    += ((preds >= 0).float() == labels).sum().item()
             total      += len(labels)
-    return total_loss / total, correct / total
+            for c in [0, 1]:
+                mask = labels == c
+                if mask.any():
+                    n_class[c]      += mask.sum().item()
+                    correct_class[c] += ((preds[mask] >= 0).float() == labels[mask]).sum().item()
+    return total_loss / total, _balanced_acc(n_class, correct_class)
 
 
 def run_generic_epoch(loader, extractor, head, criterion, device, optimizer=None, clip_grad=1.0):
@@ -201,7 +219,8 @@ def run_generic_epoch(loader, extractor, head, criterion, device, optimizer=None
     training = optimizer is not None
     extractor.train(training)
     head.train(training)
-    total_loss = correct = total = 0
+    total_loss = total = 0
+    n_class = [0, 0]; correct_class = [0, 0]
     ctx = torch.enable_grad() if training else torch.no_grad()
     with ctx:
         for inputs, labels in loader:
@@ -215,9 +234,13 @@ def run_generic_epoch(loader, extractor, head, criterion, device, optimizer=None
                 _clip_grads(optimizer, clip_grad)
                 optimizer.step()
             total_loss += loss.item() * len(labels)
-            correct    += ((preds >= 0).float() == labels).sum().item()
             total      += len(labels)
-    return total_loss / total, correct / total
+            for c in [0, 1]:
+                mask = labels == c
+                if mask.any():
+                    n_class[c]      += mask.sum().item()
+                    correct_class[c] += ((preds[mask] >= 0).float() == labels[mask]).sum().item()
+    return total_loss / total, _balanced_acc(n_class, correct_class)
 
 
 def run_fusion_epoch(loader, fusion, criterion, device, optimizer=None,
@@ -225,7 +248,8 @@ def run_fusion_epoch(loader, fusion, criterion, device, optimizer=None,
                      clip_grad=1.0):
     training = optimizer is not None
     fusion.train(training)
-    total_loss = correct = total = 0
+    total_loss = total = 0
+    n_class = [0, 0]; correct_class = [0, 0]
     ctx = torch.enable_grad() if training else torch.no_grad()
     with ctx:
         for img_t, aud_t, vid_t, labels in loader:
@@ -245,9 +269,13 @@ def run_fusion_epoch(loader, fusion, criterion, device, optimizer=None,
                 _clip_grads(optimizer, clip_grad)
                 optimizer.step()
             total_loss += loss.item() * len(labels)
-            correct    += ((preds >= 0).float() == labels).sum().item()
             total      += len(labels)
-    return total_loss / total, correct / total
+            for c in [0, 1]:
+                mask = labels == c
+                if mask.any():
+                    n_class[c]      += mask.sum().item()
+                    correct_class[c] += ((preds[mask] >= 0).float() == labels[mask]).sum().item()
+    return total_loss / total, _balanced_acc(n_class, correct_class)
 
 
 def save_checkpoint(path, epoch, val_acc, val_loss,

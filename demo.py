@@ -15,6 +15,7 @@ import gradio as gr
 import numpy as np
 import soundfile as sf
 import torch
+import torch.nn as nn
 from PIL import Image
 from torchvision import transforms
 
@@ -36,8 +37,44 @@ img_ext  = ImageFeatureExtractor(pretrained=True).to(device).eval()
 aud_ext  = AudioFeatureExtractor(sample_rate=16000).to(device).eval()
 vid_ext  = VideoFeatureExtractor(pretrained=True).to(device).eval()
 fusion   = MultiModalFusionClassifier().to(device).eval()
+head     = nn.Sequential(
+    nn.Linear(512, 256), nn.ReLU(), nn.Dropout(0.4),
+    nn.Linear(256, 64),  nn.ReLU(), nn.Dropout(0.3),
+    nn.Linear(64, 1),
+).to(device).eval()
 face_det = FaceDetector(device=device)
-gradcam  = DeepfakeGradCAM(img_ext, fusion)
+
+# Track whether trained fusion weights were loaded; built lazily after checkpoint load.
+_fusion_loaded = False
+gradcam: DeepfakeGradCAM | None = None
+
+
+class _FusionImageScorer(nn.Module):
+    """Wraps fusion so GradCAM can call it with a single image embedding tensor."""
+    def __init__(self, fusion_model: MultiModalFusionClassifier):
+        super().__init__()
+        self.fusion = fusion_model
+
+    def forward(self, emb: torch.Tensor) -> torch.Tensor:
+        return self.fusion(img_emb=emb)
+
+
+def _build_gradcam():
+    """Build GradCAM against whichever scorer actually has trained weights."""
+    global gradcam
+    scorer = _FusionImageScorer(fusion) if _fusion_loaded else head
+    gradcam = DeepfakeGradCAM(img_ext, scorer)
+
+
+def _predict_proba(img_emb=None, aud_emb=None, vid_emb=None) -> float:
+    """Returns fake probability in [0, 1] using whichever classifier was trained."""
+    with torch.no_grad():
+        if _fusion_loaded:
+            logits = fusion(img_emb=img_emb, aud_emb=aud_emb, vid_emb=vid_emb)
+        else:
+            emb = img_emb if img_emb is not None else (vid_emb if vid_emb is not None else aud_emb)
+            logits = head(emb)
+    return torch.sigmoid(logits).squeeze().item()
 
 _IMG_TRANSFORM = transforms.Compose([
     transforms.Resize((299, 299)),
@@ -52,12 +89,21 @@ _VID_TRANSFORM = transforms.Compose([
 
 
 def _load_checkpoint(path: str):
+    global _fusion_loaded
     state = torch.load(path, map_location=device)
     img_ext.load_state_dict(state.get("img_extractor", {}), strict=False)
     aud_ext.load_state_dict(state.get("aud_extractor", {}), strict=False)
     vid_ext.load_state_dict(state.get("vid_extractor", {}), strict=False)
-    fusion.load_state_dict(state.get("fusion", {}), strict=False)
-    print(f"Loaded checkpoint: {path}")
+    head_state = state.get("head", {})
+    if head_state:
+        head.load_state_dict(head_state)
+    fusion_state = state.get("fusion", {})
+    if fusion_state:
+        fusion.load_state_dict(fusion_state)
+        _fusion_loaded = True
+    val_info = f"  val_acc={state['val_acc']:.4f}" if "val_acc" in state else ""
+    classifier = "fusion" if _fusion_loaded else "head"
+    print(f"Loaded checkpoint: {path}  (classifier={classifier}){val_info}")
 
 
 # ---------------------------------------------------------------------------
@@ -79,13 +125,14 @@ def predict_image(image: Image.Image):
     cam_overlay = gradcam.overlay(cam_np, image.resize((224, 224)))
 
     with torch.no_grad():
-        score = fusion(img_emb=img_ext(tensor)).squeeze().item()
+        emb = img_ext(tensor)
+    prob = _predict_proba(img_emb=emb)
 
-    label   = "FAKE" if score >= 0.5 else "REAL"
+    label   = "FAKE" if prob >= 0.35 else "REAL"
     dct     = dct_peak_score(tensor.squeeze(0))
-    verdict = f"**{label}** — {score:.1%} fake probability"
+    verdict = f"**{label}** — {prob:.1%} fake probability"
     details = f"DCT peak score: {dct:.4f}"
-    return verdict, round(score, 4), details, annotated, cam_overlay
+    return verdict, round(prob, 4), details, annotated, cam_overlay
 
 
 def predict_audio(audio):
@@ -104,9 +151,10 @@ def predict_audio(audio):
     waveform = np.pad(waveform, (0, max(0, target - len(waveform))))[:target]
     tensor = torch.from_numpy(waveform).unsqueeze(0).to(device)
     with torch.no_grad():
-        score = fusion(aud_emb=aud_ext(tensor)).squeeze().item()
-    label = "FAKE" if score >= 0.5 else "REAL"
-    return f"**{label}** — {score:.1%} fake probability", round(score, 4)
+        emb = aud_ext(tensor)
+    prob = _predict_proba(aud_emb=emb)
+    label = "FAKE" if prob >= 0.35 else "REAL"
+    return f"**{label}** — {prob:.1%} fake probability", round(prob, 4)
 
 
 def predict_video(video_path: str):
@@ -172,15 +220,14 @@ def predict_video(video_path: str):
     if img_emb is None and vid_emb is None:
         return "Could not extract any features from this video.", 0.0, ""
 
-    with torch.no_grad():
-        score = fusion(img_emb=img_emb, aud_emb=aud_emb, vid_emb=vid_emb).squeeze().item()
+    prob = _predict_proba(img_emb=img_emb, aud_emb=aud_emb, vid_emb=vid_emb)
 
-    label   = "FAKE" if score >= 0.5 else "REAL"
-    verdict = f"**{label}** — {score:.1%} fake probability"
+    label   = "FAKE" if prob >= 0.35 else "REAL"
+    verdict = f"**{label}** — {prob:.1%} fake probability"
     details_parts = [f"Modalities: {', '.join(modalities)}"]
     if tc is not None:
         details_parts.append(f"Temporal consistency: {tc:.4f}")
-    return verdict, round(score, 4), " | ".join(details_parts)
+    return verdict, round(prob, 4), " | ".join(details_parts)
 
 
 # ---------------------------------------------------------------------------
@@ -244,4 +291,5 @@ if __name__ == "__main__":
     else:
         print(f"No checkpoint at {args.checkpoint} — running with untrained weights")
 
+    _build_gradcam()  # must come after checkpoint load to target the right scorer
     demo.launch(share=args.share, server_port=args.port, theme=gr.themes.Soft())

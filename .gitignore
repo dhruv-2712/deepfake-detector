@@ -34,3 +34,4 @@ face_detection_out.jpg
 
 # Claude Code session data
 .claude/
+upload_space.py
