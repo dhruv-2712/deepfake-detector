@@ -11,45 +11,70 @@ pinned: false
 
 # Deepfake Detector
 
-A multimodal deepfake detection system that analyses images, audio, and video to classify media as real or AI-generated.
+A multimodal deepfake detection system that analyses images, audio, and video using three specialist neural networks fused via cross-attention.
 
-## How it works
+**83.3% balanced accuracy · 76.5% AUC** on FaceForensics++ c40 (held-out test set)
 
-Three specialist models each extract a 512-dimensional fingerprint from their respective input:
+[Live Demo](https://huggingface.co/spaces/dhruv2712/deepfake-detector) · [Model Weights](https://huggingface.co/dhruv2712/deepfake-detector-weights)
+
+---
+
+## Architecture
+
+Three extractors each output a 512-dimensional embedding, which a cross-attention fusion classifier combines into a single fake probability:
 
 | Modality | Model | What it detects |
 |---|---|---|
-| Image | XceptionNet + SRM noise filters | GAN texture artifacts, camera noise anomalies |
+| Image | XceptionNet + SRM noise filters | GAN texture artifacts, compression anomalies |
 | Audio | LFCC + LCNN | Voice cloning artifacts in frequency patterns |
 | Video | R3D-18 (3D CNN) | Unnatural motion, temporal inconsistency |
 
-A cross-attention fusion classifier combines whichever modalities are available and outputs a single **fake probability (0–1)**.
+The fusion classifier uses multi-head cross-attention so it can operate on any subset of modalities — image-only, audio-only, video-only, or any combination.
 
-## Project structure
+---
+
+## Results
+
+Trained on **FaceForensics++ c40** (heavy compression — the hardest variant):
+
+| Metric | Value |
+|---|---|
+| Balanced Accuracy (val) | 83.3% |
+| AUC (held-out test) | 76.5% |
+| Average Precision | 81.5% |
+| Equal Error Rate | 30.2% |
+
+Covers all five FF++ manipulation types: Deepfakes, Face2Face, FaceSwap, NeuralTextures, FaceShifter.
+
+> **Note:** The model detects face-swap and face-reenactment fakes (FF++ style). It was not trained on fully GAN-synthesized faces (e.g. StyleGAN).
+
+---
+
+## Project Structure
 
 ```
 detectors/
-  image/extractor.py       # XceptionNet + SRM + DCT analysis
-  audio/extractor.py       # LFCC feature extraction + LCNN
-  video/extractor.py       # R3D-18 temporal feature extraction
+  image/extractor.py       # XceptionNet backbone + SRM residual filters
+  audio/extractor.py       # LFCC feature extraction + LCNN classifier
+  video/extractor.py       # R3D-18 3D CNN temporal extractor
 fusion/
-  cross_attention.py       # Multi-head attention fusion + MLP classifier
+  cross_attention.py       # Multi-head cross-attention fusion + MLP head
 benchmarks/
-  ff_plusplus.py           # FaceForensics++ dataset loader
-  asvspoof.py              # ASVspoof 2019 dataset loader
-  kaggle_faces.py          # 140k Real and Fake Faces dataset loader
+  ff_plusplus.py           # FaceForensics++ dataset loader (video-based)
+  kaggle_faces.py          # 140k Real and Fake Faces loader (JPEG-based)
+  asvspoof.py              # ASVspoof 2019 audio dataset loader
 utils/
-  face_align.py            # MTCNN face detection and cropping
-  gradcam.py               # Grad-CAM heatmap visualization
-  augmentations.py         # Training augmentations (JPEG, noise, flips)
-scripts/
-  preextract.py            # Pre-extract embeddings to disk for faster training
-  export_onnx.py           # Export trained models to ONNX
-api/main.py                # FastAPI REST endpoints
-demo.py                    # Gradio web UI
-train.py                   # Training script
-eval.py                    # Evaluation script
+  face_align.py            # MTCNN face detection and alignment
+  gradcam.py               # Grad-CAM heatmap over XceptionNet backbone
+  augmentations.py         # JPEG compression, noise, flip augmentations
+api/main.py                # FastAPI REST API
+demo.py                    # Gradio web demo
+train.py                   # Training script (image / audio / video / fusion)
+eval.py                    # Evaluation script (AUC, AP, EER)
+extract_frames.py          # One-time frame extraction from FF++ videos to JPEG
 ```
+
+---
 
 ## Setup
 
@@ -62,95 +87,97 @@ PyTorch with CUDA (recommended):
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 ```
 
-## Running the demo
-
-```bash
-python demo.py                                   # random weights
-python demo.py --checkpoint checkpoints/best.pt  # trained weights
-```
-
-Opens at `http://localhost:7860`. Supports image, audio, and video input with face detection, Grad-CAM heatmap, and fake probability score.
+---
 
 ## Training
 
-### 140k Real and Fake Faces (easiest, image-only)
-
-Download from Kaggle: `xhlulu/140k-real-and-fake-faces`
+### Step 1 — Extract frames from FF++ videos (one-time, much faster training)
 
 ```bash
-python train.py --modality image \
-                --kaggle_root /path/to/kaggle-faces \
-                --workers 2
+python extract_frames.py --ffpp_root data/ffpp --out data/ffpp_frames --compression c40
 ```
 
-### FaceForensics++ (image or video)
+This converts MP4 videos to JPEG frames so each training epoch takes minutes instead of hours.
+
+### Step 2 — Train the image detector
 
 ```bash
-python train.py --modality image --ffpp_root /path/to/FaceForensics++
-python train.py --modality video --ffpp_root /path/to/FaceForensics++
+python train.py \
+  --kaggle_root data/ffpp_frames \
+  --checkpoint_dir checkpoints/ffpp \
+  --fake_weight 5.0 \
+  --workers 4
 ```
 
-### ASVspoof 2019 (audio)
+`--fake_weight 5.0` compensates for the 5:1 fake:real imbalance in FF++ (5 manipulation types × 720 videos vs 720 real videos).
+
+### Other modalities
 
 ```bash
-python train.py --modality audio --asvspoof_root /path/to/ASVspoof2019
+# Audio (ASVspoof 2019)
+python train.py --asvspoof_root data/ASVspoof2019 --checkpoint_dir checkpoints/audio
+
+# Video (FF++ raw videos, slower)
+python train.py --ffpp_root data/ffpp --compression c40 --modality video --checkpoint_dir checkpoints/video
 ```
 
-Best checkpoint is saved automatically to `checkpoints/best.pt`.
-
-### Key training arguments
+### Key arguments
 
 | Argument | Default | Description |
 |---|---|---|
-| `--epochs` | 50 | Number of training epochs |
-| `--batch_size` | 16 | Batch size |
-| `--lr` | 1e-4 | Learning rate |
-| `--fake_weight` | 2.0 | Loss weight for fake samples |
-| `--workers` | 4 | DataLoader workers (use 0 on Windows CPU) |
+| `--epochs` | 30 | Training epochs |
+| `--batch_size` | 8 | Batch size (keep low for 6GB VRAM) |
+| `--fake_weight` | 1.0 | BCEWithLogitsLoss pos_weight for class imbalance |
+| `--patience` | 10 | Early stopping patience |
+| `--workers` | 0 | DataLoader workers (set 4+ on Linux/Mac) |
+
+---
 
 ## Evaluation
 
 ```bash
-python eval.py --checkpoint checkpoints/best.pt \
-               --ffpp_root /path/to/FaceForensics++ \
-               --modality image
+python eval.py \
+  --checkpoint checkpoints/ffpp/best.pt \
+  --kaggle_root data/ffpp_frames
 ```
 
-Reports AUC, Average Precision, and EER per manipulation type (Deepfakes, Face2Face, FaceSwap, NeuralTextures, FaceShifter).
+Reports AUC, Average Precision, and EER on the held-out test split.
+
+---
+
+## Demo
+
+```bash
+python demo.py --checkpoint checkpoints/ffpp/best.pt
+```
+
+Opens at `http://localhost:7860`. Upload an image, audio clip, or video to get:
+- Fake probability score (0–1)
+- Face detection bounding boxes
+- Grad-CAM heatmap showing which regions triggered the detection
+- DCT frequency analysis score
+
+---
 
 ## REST API
 
 ```bash
-uvicorn api.main:app --reload
+python api/main.py --checkpoint checkpoints/ffpp/best.pt
 ```
 
-| Endpoint | Input |
-|---|---|
-| `POST /detect/image` | image file |
-| `POST /detect/audio` | audio file |
-| `POST /detect/video` | video file |
-
-Returns `{"is_fake": true/false, "confidence": 0.91, "modalities_used": ["image"]}`.
+| Endpoint | Input | Returns |
+|---|---|---|
+| `POST /detect/image` | image file | `{"is_fake": bool, "confidence": float}` |
+| `POST /detect/audio` | audio file | `{"is_fake": bool, "confidence": float}` |
+| `POST /detect/video` | video file | `{"is_fake": bool, "confidence": float, "modalities_used": [...]}` |
 
 Interactive docs at `http://localhost:8000/docs`.
 
-## Faster training with pre-extracted embeddings
+---
 
-```bash
-# Extract once
-python scripts/preextract.py --checkpoint checkpoints/best.pt \
-                              --ffpp_root /data/FaceForensics++ \
-                              --modality image \
-                              --output_dir embeddings/
+## How Training Works
 
-# Train fusion head only (10-50x faster)
-python train.py --modality image --embeddings_dir embeddings/
-```
-
-## Export to ONNX
-
-```bash
-python scripts/export_onnx.py --checkpoint checkpoints/best.pt --output_dir onnx/
-```
-
-Exports all five components (image extractor, audio extractor, video extractor, head classifier, fusion classifier) separately.
+- **Balanced accuracy** `(TPR + TNR) / 2` is used as the early-stopping metric instead of raw accuracy, which would be gamed by always predicting the majority class in a 5:1 imbalanced dataset.
+- **Linear warmup** over 3 epochs followed by cosine annealing prevents early divergence.
+- **Gradient clipping** (`max_norm=1.0`) stabilises training on XceptionNet's large backbone.
+- **WeightedRandomSampler** oversamples the minority (real) class within each batch.
